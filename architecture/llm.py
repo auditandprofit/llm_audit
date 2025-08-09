@@ -5,9 +5,29 @@ import asyncio
 import time
 import json
 import jsonschema
-import re
+import random
 
 from persistence import RunStore, BlobStore, RunEvent, EventType
+
+
+def _last_json_obj(text: str):
+    """Return the last valid JSON object embedded in ``text``, else None."""
+    dec = json.JSONDecoder()
+    s = text or ""
+    last = None
+    i = 0
+    while True:
+        while i < len(s) and s[i].isspace():
+            i += 1
+        if i >= len(s):
+            break
+        try:
+            obj, end = dec.raw_decode(s, i)
+            last = obj
+            i = end
+        except json.JSONDecodeError:
+            i += 1
+    return last
 
 
 # =============== Prompt Packet & Schemas ===============
@@ -147,7 +167,8 @@ async def call_llm_with_schema(
     condition_id: str = "",
 ):
     t0 = time.time()
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    while True:
         resp = await llm.complete(
             system=system,
             messages=messages,
@@ -156,41 +177,40 @@ async def call_llm_with_schema(
             top_p=top_p,
             max_tokens=max_tokens,
         )
-        text = resp.get("text") if isinstance(resp, dict) else resp
-        m = re.search(r"\{.*\}\s*$", text or "", re.S)
-        if not m:
+        text = resp.get("text") if isinstance(resp, dict) else (resp or "")
+        obj = _last_json_obj(text)
+
+        if obj is None:
             messages.append(
                 {
                     "role": "system",
                     "content": "Your previous reply did not contain a JSON object. Return ONLY JSON.",
                 }
             )
+            attempt += 1
             if run_store:
                 run_store.append(
                     RunEvent(
                         ts=time.time(),
                         run_id=run_id,
                         type=EventType.LLM_RETRY,
-                        data={"task_id": task_id, "finding_id": finding_id, "condition_id": condition_id, "attempt": attempt + 1},
+                        data={
+                            "task_id": task_id,
+                            "finding_id": finding_id,
+                            "condition_id": condition_id,
+                            "attempt": attempt,
+                            "reason": "no_json_object",
+                        },
                     )
                 )
+            if attempt > max_retries:
+                LLM_FAILURES.append("no_json_object")
+                raise ValueError("LLM returned no JSON object")
+            await asyncio.sleep(min(1.5 ** attempt, 8) + random.random() * 0.25)
             continue
+
         try:
-            obj = json.loads(m.group(0))
             jsonschema.validate(obj, schema)
-            latency = time.time() - t0
-            prompt_bytes = json.dumps({"system": system, "messages": messages}).encode()
-            response_bytes = text.encode()
-            prompt_sha = blob_store.put(prompt_bytes) if blob_store else None
-            response_sha = blob_store.put(response_bytes) if blob_store else None
-            usage = {
-                "latency_s": latency,
-                "prompt_sha": prompt_sha,
-                "response_sha": response_sha,
-                "prompt_tokens": len(prompt_bytes.split()),
-                "response_tokens": len(response_bytes.split()),
-            }
-            return obj, usage
         except Exception as e:
             messages.append(
                 {
@@ -198,7 +218,39 @@ async def call_llm_with_schema(
                     "content": f"Your JSON was invalid ({e}). Fix it to match the schema exactly.",
                 }
             )
-            if attempt == max_retries:
+            attempt += 1
+            if run_store:
+                run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=run_id,
+                        type=EventType.LLM_RETRY,
+                        data={
+                            "task_id": task_id,
+                            "finding_id": finding_id,
+                            "condition_id": condition_id,
+                            "attempt": attempt,
+                            "reason": "schema_validation_error",
+                            "error": str(e),
+                        },
+                    )
+                )
+            if attempt > max_retries:
                 LLM_FAILURES.append(str(e))
                 raise
+            await asyncio.sleep(min(1.5 ** attempt, 8) + random.random() * 0.25)
             continue
+
+        latency = time.time() - t0
+        prompt_bytes = json.dumps({"system": system, "messages": messages}).encode()
+        response_bytes = (text or "").encode()
+        prompt_sha = blob_store.put(prompt_bytes) if blob_store else None
+        response_sha = blob_store.put(response_bytes) if blob_store else None
+        usage = {
+            "latency_s": latency,
+            "prompt_sha": prompt_sha,
+            "response_sha": response_sha,
+            "prompt_tokens": len(prompt_bytes.split()),
+            "response_tokens": len(response_bytes.split()),
+        }
+        return obj, usage

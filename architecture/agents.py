@@ -69,15 +69,19 @@ class TinyShellAgent:
             few_shot_example=few_shot,
         )
         messages = [{"role": "system", "content": packet}]
-        out, _usage = await call_llm_with_schema(
-            self.llm,
-            system="Follow the packet.",
-            messages=messages,
-            schema=SCOUT_OUTPUT_SCHEMA,
-            temperature=0,
-            top_p=1,
-            max_tokens=1024,
-        )
+        try:
+            out, _usage = await call_llm_with_schema(
+                self.llm,
+                system="Follow the packet.",
+                messages=messages,
+                schema=SCOUT_OUTPUT_SCHEMA,
+                temperature=0,
+                top_p=1,
+                max_tokens=1024,
+            )
+        except Exception:
+            t1 = time.time()
+            return AgentReport(start_file=start_file, findings=[], agent_id=self.agent_id, duration_s=t1 - t0)
         findings: List[Finding] = []
         for f in out["findings"]:
             fin = Finding(id=_id("finding"), origin_file=f["origin_file"], claim=f["claim"], agent_id=self.agent_id)
