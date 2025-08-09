@@ -127,9 +127,13 @@ SCOUT_OUTPUT_SCHEMA = {
 }
 
 
-async def call_llm_with_schema(llm, *, system, messages, schema, max_retries=2):
+LLM_FAILURES: List[str] = []
+
+async def call_llm_with_schema(llm, *, system, messages, schema, max_retries=2,
+                               temperature=0, top_p=1, max_tokens=1024):
     for attempt in range(max_retries + 1):
-        resp = await llm.complete(system=system, messages=messages, json_schema=schema)
+        resp = await llm.complete(system=system, messages=messages, json_schema=schema,
+                                  temperature=temperature, top_p=top_p, max_tokens=max_tokens)
         text = resp.get("text") if isinstance(resp, dict) else resp
         m = re.search(r"\{.*\}\s*$", text or "", re.S)
         if not m:
@@ -141,6 +145,8 @@ async def call_llm_with_schema(llm, *, system, messages, schema, max_retries=2):
             return obj
         except Exception as e:
             messages.append({"role": "system", "content": f"Your JSON was invalid ({e}). Fix it to match the schema exactly."})
+    LLM_FAILURES.append("exhausted retries")
+    messages.append({"role": "system", "content": "LLM call failed after retries"})
     raise ValueError("LLM failed to produce valid JSON after retries")
 
 
@@ -187,6 +193,7 @@ class SustainingCondition:
     depth: int = 0
     plan_kind: Optional[str] = None
     plan_params: Dict[str, Any] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -200,6 +207,7 @@ class Finding:
     invalidated: bool = False
     invalidation_reason: Optional[str] = None
     agent_id: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -242,6 +250,8 @@ def render_report(rep: AuditReport) -> str:
                 lines.append(" " * indent + f"{badge(c.status)} {c.text}")
                 for ev in c.evidence:
                     lines.append(" " * (indent + 2) + f"- {ev.summary}")
+                for note in c.notes:
+                    lines.append(" " * (indent + 2) + f"# {note}")
                 for ch in c.children:
                     walk(ch, indent + 2)
 
@@ -280,12 +290,24 @@ class WebSearchAdapter:
 
 class LLMClient:
     async def complete(self, *, system: str, messages: List[Dict[str, str]],
-                       json_schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if json_schema and "status" in json_schema.get("properties", {}):
-            text = json.dumps({"status": "UNKNOWN", "evidence": [], "children": [], "notes": []})
-            return {"text": text}
+                       json_schema: Optional[Dict[str, Any]] = None,
+                       temperature: float = 0, top_p: float = 1,
+                       max_tokens: int = 1024) -> Dict[str, Any]:
         if json_schema and "findings" in json_schema.get("properties", {}):
-            text = json.dumps({"findings": [], "notes": []})
+            text = json.dumps({
+                "findings": [{
+                    "claim": "Simulated claim",
+                    "origin_file": "start.py",
+                    "root_conditions": [
+                        {"text": "input is sanitized", "plan_kind": "IS_USER_CONTROLLED", "plan_params": {}},
+                        {"text": "path reaches sink", "plan_kind": "PATH_EXISTS", "plan_params": {"sink": "util.eval"}},
+                    ],
+                }],
+                "notes": []
+            })
+            return {"text": text}
+        if json_schema and "status" in json_schema.get("properties", {}):
+            text = json.dumps({"status": "UNKNOWN", "evidence": [], "children": [], "notes": ["demo note"]})
             return {"text": text}
         return {"text": "{}"}
 
@@ -331,7 +353,8 @@ class TinyShellAgent:
         )
         messages = [{"role": "system", "content": packet}]
         out = await call_llm_with_schema(
-            self.llm, system="Follow the packet.", messages=messages, schema=SCOUT_OUTPUT_SCHEMA
+            self.llm, system="Follow the packet.", messages=messages, schema=SCOUT_OUTPUT_SCHEMA,
+            temperature=0, top_p=1, max_tokens=1024
         )
         findings: List[Finding] = []
         for f in out["findings"]:
@@ -373,6 +396,7 @@ class ValidationAgent:
             "finding_claim": context.get("finding_claim"),
             "siblings_status": context.get("siblings_status"),
             "known_evidence": context.get("finding_evidence"),
+            "max_children_allowed": context.get("max_children_allowed"),
         }
         few_shot = json.dumps({
             "status": "UNKNOWN",
@@ -399,7 +423,8 @@ class ValidationAgent:
         )
         messages = [{"role": "system", "content": packet}]
         out = await call_llm_with_schema(
-            self.llm, system="Follow the packet.", messages=messages, schema=VALIDATION_OUTPUT_SCHEMA
+            self.llm, system="Follow the packet.", messages=messages, schema=VALIDATION_OUTPUT_SCHEMA,
+            temperature=0, top_p=1, max_tokens=1024
         )
         updated = SustainingCondition(
             id=cond.id,
@@ -429,6 +454,7 @@ class ValidationAgent:
                     plan_params=ch.get("plan_params", {}),
                 )
             )
+        updated.notes = out.get("notes", [])
         return updated
 
 
@@ -442,6 +468,7 @@ class OrchestratorConfig:
     concurrent_validations: int = 16
     early_invalidate_on_first_violation: bool = True
     dedup_normalize_text: bool = True
+    max_children_allowed: int = 3
 
 
 @dataclass
@@ -546,7 +573,7 @@ class AuditOrchestrator:
             w.cancel()
         t1 = time.time()
         return AuditReport(findings=findings, started_at=t0, finished_at=t1,
-                           meta={"tasks_created": tasks_created})
+                           meta={"tasks_created": tasks_created, "llm_failures": LLM_FAILURES})
 
     async def _handle_task(self, task: Task, findings: List[Finding],
                            task_queue: asyncio.PriorityQueue):
@@ -569,15 +596,17 @@ class AuditOrchestrator:
             "finding_claim": finding.claim,
             "finding_evidence": [asdict(e) for e in finding.evidence],
             "siblings_status": [c.status.name for c in finding.root_conditions if c.id != cond.id],
+            "max_children_allowed": self.cfg.max_children_allowed,
         }
         updated = await self.validation_agent.validate(cond, context)
         cond.evidence.extend(updated.evidence)
         cond.status = updated.status
+        cond.notes.extend(updated.notes)
         if cond.status == Status.VIOLATED and self.cfg.early_invalidate_on_first_violation:
             finding.invalidated = True
             finding.invalidation_reason = f"Condition failed: {cond.text}"
             return
-        for child in updated.children:
+        for child in updated.children[: self.cfg.max_children_allowed]:
             child.parent_id = cond.id
             child.depth = cond.depth + 1
             node = self._index_condition(child)
