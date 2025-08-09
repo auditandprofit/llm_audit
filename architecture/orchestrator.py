@@ -18,18 +18,19 @@ if __package__ in (None, ""):
 from persistence import RunStore, BlobStore, RunEvent, EventType, DerivedState
 
 from .adapters import CodebaseAdapter, WebSearchAdapter, LLMClient
-from .strategies import StrategyRegistry, PathExistsStrategy, IsUserControlledStrategy
-from .agents import ValidationAgent, TinyShellAgent
+from .agents import ShellLLMAgent, TinyShellAgent
 from .models import (
     SustainingCondition,
     Finding,
     AgentReport,
     AuditReport,
+    Evidence,
+    CodeSpan,
     Status,
     _id,
     render_report,
 )
-from .llm import LLM_FAILURES
+from .llm import LLM_FAILURES, VALIDATION_OUTPUT_SCHEMA
 from workflow import compute_digest
 
 
@@ -67,10 +68,7 @@ class AuditOrchestrator:
         self.llm = llm
         self.web = web
         self.cfg = config or OrchestratorConfig()
-        registry = StrategyRegistry()
-        registry.register(PathExistsStrategy(llm=llm))
-        registry.register(IsUserControlledStrategy(llm=llm))
-        self.validation_agent = ValidationAgent(registry)
+        self.agent = ShellLLMAgent(llm)
         self._condition_index: Dict[str, str] = {}  # digest -> cond.id
         self._condition_store: Dict[str, SustainingCondition] = {}
         self._per_finding_tasks = defaultdict(int)
@@ -78,7 +76,7 @@ class AuditOrchestrator:
         self.blob_store = blob_store or BlobStore()
 
     def _index_condition(self, cond: SustainingCondition) -> SustainingCondition:
-        digest = compute_digest(cond.text, cond.plan_kind, cond.plan_params)
+        digest = compute_digest(cond.text, cond.plan_params)
         if digest in self._condition_index:
             existing_id = self._condition_index[digest]
             return self._condition_store[existing_id]
@@ -137,7 +135,6 @@ class AuditOrchestrator:
                     "status": cond.status.name,
                     "parent_id": cond.parent_id,
                     "depth": cond.depth,
-                    "plan_kind": cond.plan_kind,
                     "plan_params": cond.plan_params,
                 }
                 if cond
@@ -268,13 +265,38 @@ class AuditOrchestrator:
             "finding_claim": finding.claim,
             "finding_evidence": [asdict(e) for e in finding.evidence],
             "siblings_status": [c.status.name for c in finding.root_conditions if c.id != cond.id],
-            "max_children_allowed": self.cfg.max_children_allowed,
         }
-        result = await self.validation_agent.validate(cond, context)
-        assert isinstance(result.status, Status)
-        cond.evidence.extend(result.evidence)
-        cond.status = result.status
-        cond.notes.extend(result.notes)
+        out = await self.agent.run_task(
+            objective=cond.text,
+            context=context,
+            constraints={"max_children": self.cfg.max_children_allowed},
+            schema=VALIDATION_OUTPUT_SCHEMA,
+        )
+        status = Status[out.get("status", "UNKNOWN")]
+        notes = out.get("notes", [])
+        evidence = [
+            Evidence(
+                id=_id("ev"),
+                source=ev.get("source", ""),
+                summary=ev.get("summary", ""),
+                locations=[CodeSpan(**loc) for loc in ev.get("locations", [])],
+                strength=ev.get("strength", 0.5),
+                raw_refs=ev.get("raw_refs", {}),
+                witness=ev.get("witness"),
+            )
+            for ev in out.get("evidence", [])
+        ]
+        children = [
+            SustainingCondition(
+                id=_id("cond"),
+                text=ch["text"],
+                plan_params=ch.get("plan_params", {}),
+            )
+            for ch in out.get("children", [])
+        ]
+        cond.evidence.extend(evidence)
+        cond.status = status
+        cond.notes.extend(notes)
         self.run_store.append(
             RunEvent(
                 ts=time.time(),
@@ -292,7 +314,7 @@ class AuditOrchestrator:
             finding.invalidated = True
             finding.invalidation_reason = f"Condition failed: {cond.text}"
             return
-        for child in result.children[: self.cfg.max_children_allowed]:
+        for child in children[: self.cfg.max_children_allowed]:
             child.parent_id = cond.id
             child.depth = cond.depth + 1
             node = self._index_condition(child)

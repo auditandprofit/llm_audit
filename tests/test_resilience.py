@@ -52,8 +52,8 @@ def test_worker_continues_after_task_error():
     orch = AuditOrchestrator(code=code, llm=llm, run_store=run_store, config=OrchestratorConfig(concurrent_validations=1))
 
     async def fake_scout(start_file, user_goal):
-        c1 = SustainingCondition(id="c1", text="a", plan_kind="PATH_EXISTS", plan_params={})
-        c2 = SustainingCondition(id="c2", text="b", plan_kind="PATH_EXISTS", plan_params={})
+        c1 = SustainingCondition(id="c1", text="a", plan_params={})
+        c2 = SustainingCondition(id="c2", text="b", plan_params={})
         f = Finding(id="f1", origin_file="f.py", claim="claim", agent_id="agent", root_conditions=[c1, c2])
         return AgentReport(start_file=start_file, findings=[f], agent_id="agent", duration_s=0)
 

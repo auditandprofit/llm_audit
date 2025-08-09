@@ -4,31 +4,49 @@ from typing import Any, Dict, List, Optional
 import time
 import json
 
-from .strategies import StrategyRegistry
 from .models import (
-    PlanKind,
-    ValidationInput,
-    ValidationResult,
     SustainingCondition,
     Finding,
     AgentReport,
     _id,
 )
 from .adapters import CodebaseAdapter, LLMClient
-from .llm import PROMPT_PACKET, SCOUT_OUTPUT_SCHEMA, call_llm_with_schema
+from .llm import (
+    PROMPT_PACKET,
+    SCOUT_OUTPUT_SCHEMA,
+    call_llm_with_schema,
+)
 
 
-class ValidationAgent:
-    def __init__(self, registry: StrategyRegistry):
-        self.r = registry
+class ShellLLMAgent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
 
-    async def validate(self, cond: SustainingCondition, ctx: Dict[str, Any]) -> ValidationResult:
+    async def run_task(
+        self,
+        *,
+        objective: str,
+        context: Dict[str, Any],
+        constraints: Dict[str, Any],
+        schema: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute a task and return JSON matching ``schema``."""
+
+        prompt_ctx = {
+            "objective": objective,
+            "context": context,
+            "constraints": constraints,
+        }
+        messages = [{"role": "system", "content": json.dumps(prompt_ctx)}]
+        resp = await self.llm.complete(
+            system="run_task",
+            messages=messages,
+            json_schema=schema,
+        )
         try:
-            kind = PlanKind(cond.plan_kind) if cond.plan_kind else PlanKind.PATH_EXISTS
-        except ValueError as e:
-            raise KeyError(f"Unknown plan kind: {cond.plan_kind}") from e
-        strat = self.r.get(kind)
-        return await strat.validate(ValidationInput(cond, ctx))
+            return json.loads(resp.get("text", "{}"))
+        except Exception:
+            return {"status": "UNKNOWN", "evidence": [], "children": [], "notes": ["invalid json"]}
 
 
 class TinyShellAgent:
@@ -51,7 +69,7 @@ class TinyShellAgent:
                     "claim": "Simulated claim",
                     "origin_file": "a.py",
                     "root_conditions": [
-                        {"text": "input is sanitized", "plan_kind": "IS_USER_CONTROLLED", "plan_params": {}}
+                        {"text": "input is sanitized", "plan_params": {}}
                     ]
                 }
             ],
@@ -90,7 +108,6 @@ class TinyShellAgent:
                     SustainingCondition(
                         id=_id("cond"),
                         text=rc["text"],
-                        plan_kind=rc.get("plan_kind"),
                         plan_params=rc.get("plan_params", {}),
                     )
                 )

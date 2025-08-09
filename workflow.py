@@ -43,12 +43,12 @@ def _normalize(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-def compute_digest(text: str, plan_kind: Optional[str], params: Dict[str, Any]) -> str:
+def compute_digest(text: str, params: Dict[str, Any]) -> str:
     """Create a deterministic digest for a node's content."""
 
     norm = _normalize(text)
     param_str = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
-    base = f"{norm}|{plan_kind or ''}|{param_str}"
+    base = f"{norm}|{param_str}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
