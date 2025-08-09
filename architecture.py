@@ -6,6 +6,142 @@ from collections import defaultdict
 import asyncio
 import time
 import uuid
+import json
+import jsonschema
+import re
+
+
+# =============== Prompt Packet & Schemas ===============
+
+PROMPT_PACKET = """\
+SYSTEM:
+You are {role}. Follow the RULES strictly.
+
+RULES:
+- Think privately; do not include analysis in output.
+- Return JSON that matches OUTPUT_SCHEMA exactly.
+- If information is missing, set fields to null and add an item to `notes`.
+- Never invent file paths or symbols; use ones provided in CONTEXT.
+- If you need sub-steps, propose them in `children`, do not execute them.
+
+TASK_INTENT: {intent}
+
+IDENTIFIERS:
+run_id: {run_id}
+finding_id: {finding_id}
+condition_id: {condition_id}
+parent_condition_id: {parent_condition_id}
+
+CONTEXT:
+{context_block}
+
+OUTPUT_SCHEMA (JSON Schema):
+{json_schema}
+
+OUTPUT_EXAMPLE:
+{few_shot_example}
+
+RESPONSE:
+Return ONLY the JSON object. No prose, no backticks.
+"""
+
+
+VALIDATION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["status", "evidence", "children", "notes"],
+    "properties": {
+        "status": {"type": "string", "enum": ["SATISFIED", "VIOLATED", "UNKNOWN"]},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["summary", "source", "strength"],
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1},
+                    "source": {"type": "string"},
+                    "locations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["file"],
+                            "properties": {
+                                "file": {"type": "string"},
+                                "start_line": {"type": ["integer", "null"]},
+                                "end_line": {"type": ["integer", "null"]},
+                                "symbol": {"type": ["string", "null"]}
+                            }
+                        }
+                    },
+                    "strength": {"type": "number", "minimum": 0, "maximum": 1},
+                    "raw_refs": {"type": "object"},
+                    "witness": {"type": ["string", "null"]}
+                }
+            }
+        },
+        "children": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["text", "plan_kind", "plan_params"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "plan_kind": {"type": "string"},
+                    "plan_params": {"type": "object"}
+                }
+            }
+        },
+        "notes": {"type": "array", "items": {"type": "string"}}
+    }
+}
+
+
+SCOUT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["findings", "notes"],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["claim", "origin_file", "root_conditions"],
+                "properties": {
+                    "claim": {"type": "string"},
+                    "origin_file": {"type": "string"},
+                    "root_conditions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["text", "plan_kind", "plan_params"],
+                            "properties": {
+                                "text": {"type": "string"},
+                                "plan_kind": {"type": "string"},
+                                "plan_params": {"type": "object"}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "notes": {"type": "array", "items": {"type": "string"}}
+    }
+}
+
+
+async def call_llm_with_schema(llm, *, system, messages, schema, max_retries=2):
+    for attempt in range(max_retries + 1):
+        resp = await llm.complete(system=system, messages=messages, json_schema=schema)
+        text = resp.get("text") if isinstance(resp, dict) else resp
+        m = re.search(r"\{.*\}\s*$", text or "", re.S)
+        if not m:
+            messages.append({"role": "system", "content": "Your previous reply did not contain a JSON object. Return ONLY JSON."})
+            continue
+        try:
+            obj = json.loads(m.group(0))
+            jsonschema.validate(obj, schema)
+            return obj
+        except Exception as e:
+            messages.append({"role": "system", "content": f"Your JSON was invalid ({e}). Fix it to match the schema exactly."})
+    raise ValueError("LLM failed to produce valid JSON after retries")
 
 
 # =============== Domain Model ===============
@@ -145,7 +281,13 @@ class WebSearchAdapter:
 class LLMClient:
     async def complete(self, *, system: str, messages: List[Dict[str, str]],
                        json_schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return {}
+        if json_schema and "status" in json_schema.get("properties", {}):
+            text = json.dumps({"status": "UNKNOWN", "evidence": [], "children": [], "notes": []})
+            return {"text": text}
+        if json_schema and "findings" in json_schema.get("properties", {}):
+            text = json.dumps({"findings": [], "notes": []})
+            return {"text": text}
+        return {"text": "{}"}
 
 
 # =============== Agents ===============
@@ -163,33 +305,51 @@ class TinyShellAgent:
 
     async def run(self, start_file: str, user_goal: Optional[str]) -> AgentReport:
         t0 = time.time()
-        logs: List[str] = ["simulated scouting"]
-        finding = Finding(
-            id=_id("finding"),
-            origin_file=start_file,
-            claim=f"Simulated claim for {start_file}",
-            severity="Low",
-            evidence=[],
-            root_conditions=[
-                SustainingCondition(
-                    id=_id("cond"),
-                    text="input is sanitized",
-                    plan_kind="IS_USER_CONTROLLED",
-                    plan_params={"symbol": "request.args"},
-                ),
-                SustainingCondition(
-                    id=_id("cond"),
-                    text="path reaches sink",
-                    plan_kind="PATH_EXISTS",
-                    plan_params={"sink": "util.eval"},
-                ),
+        context = {"start_file": start_file, "user_goal": user_goal}
+        few_shot = json.dumps({
+            "findings": [
+                {
+                    "claim": "Simulated claim",
+                    "origin_file": "a.py",
+                    "root_conditions": [
+                        {"text": "input is sanitized", "plan_kind": "IS_USER_CONTROLLED", "plan_params": {}}
+                    ]
+                }
             ],
-            agent_id=self.agent_id,
+            "notes": []
+        }, indent=2)
+        packet = PROMPT_PACKET.format(
+            role="a codebase scouting agent",
+            intent="SCOUT_FINDINGS",
+            run_id=_id("run"),
+            finding_id="",
+            condition_id="",
+            parent_condition_id="",
+            context_block=json.dumps(context, indent=2),
+            json_schema=json.dumps(SCOUT_OUTPUT_SCHEMA, indent=2),
+            few_shot_example=few_shot,
         )
+        messages = [{"role": "system", "content": packet}]
+        out = await call_llm_with_schema(
+            self.llm, system="Follow the packet.", messages=messages, schema=SCOUT_OUTPUT_SCHEMA
+        )
+        findings: List[Finding] = []
+        for f in out["findings"]:
+            fin = Finding(id=_id("finding"), origin_file=f["origin_file"], claim=f["claim"], agent_id=self.agent_id)
+            for rc in f.get("root_conditions", []):
+                fin.root_conditions.append(
+                    SustainingCondition(
+                        id=_id("cond"),
+                        text=rc["text"],
+                        plan_kind=rc.get("plan_kind"),
+                        plan_params=rc.get("plan_params", {}),
+                    )
+                )
+            findings.append(fin)
         return AgentReport(
             start_file=start_file,
-            findings=[finding],
-            logs=logs,
+            findings=findings,
+            logs=[],
             agent_id=self.agent_id,
             duration_s=time.time() - t0,
         )
@@ -206,80 +366,69 @@ class ValidationAgent:
         self.web = web
 
     async def validate(self, cond: SustainingCondition, context: Dict[str, Any]) -> SustainingCondition:
+        ctx = {
+            "condition_text": cond.text,
+            "plan_kind": cond.plan_kind,
+            "plan_params": cond.plan_params,
+            "finding_claim": context.get("finding_claim"),
+            "siblings_status": context.get("siblings_status"),
+            "known_evidence": context.get("finding_evidence"),
+        }
+        few_shot = json.dumps({
+            "status": "UNKNOWN",
+            "evidence": [],
+            "children": [
+                {
+                    "text": "trace from A to sink X",
+                    "plan_kind": "PATH_EXISTS",
+                    "plan_params": {"sink": "X"},
+                }
+            ],
+            "notes": ["Need call graph for X"],
+        }, indent=2)
+        packet = PROMPT_PACKET.format(
+            role="a static-analysis validator",
+            intent="VALIDATE_CONDITION",
+            run_id=context.get("run_id", ""),
+            finding_id=context.get("finding_id", ""),
+            condition_id=cond.id,
+            parent_condition_id=cond.parent_id,
+            context_block=json.dumps(ctx, indent=2),
+            json_schema=json.dumps(VALIDATION_OUTPUT_SCHEMA, indent=2),
+            few_shot_example=few_shot,
+        )
+        messages = [{"role": "system", "content": packet}]
+        out = await call_llm_with_schema(
+            self.llm, system="Follow the packet.", messages=messages, schema=VALIDATION_OUTPUT_SCHEMA
+        )
         updated = SustainingCondition(
             id=cond.id,
             text=cond.text,
             plan_kind=cond.plan_kind,
             plan_params=cond.plan_params,
         )
-        if cond.plan_kind == "IS_USER_CONTROLLED":
-            updated.status = Status.SATISFIED
+        updated.status = Status[out["status"]]
+        for ev in out["evidence"]:
             updated.evidence.append(
                 Evidence(
                     id=_id("ev"),
-                    source="simulation",
-                    summary=f"{cond.plan_params.get('symbol', 'input')} appears user-controlled",
-                    witness="example: request.args['q']",
+                    source=ev["source"],
+                    summary=ev["summary"],
+                    locations=[CodeSpan(**loc) for loc in ev.get("locations", [])],
+                    strength=ev["strength"],
+                    raw_refs=ev.get("raw_refs", {}),
+                    witness=ev.get("witness"),
                 )
             )
-        elif cond.plan_kind == "PATH_EXISTS":
-            if cond.text == "path reaches sink":
-                updated.children = [
-                    SustainingCondition(
-                        id=_id("cond"),
-                        text="source reachable",
-                        plan_kind="PATH_EXISTS",
-                        plan_params={"sink": cond.plan_params.get("sink")},
-                    ),
-                    SustainingCondition(
-                        id=_id("cond"),
-                        text="no filter",
-                        plan_kind="IS_AUTH_GUARDED",
-                        plan_params={"guard": "sanitize"},
-                    ),
-                ]
-            else:
-                updated.status = Status.SATISFIED
-                updated.evidence.append(
-                    Evidence(
-                        id=_id("ev"),
-                        source="simulation",
-                        summary="path found",
-                        witness="example path",
-                    )
-                )
-        elif cond.plan_kind == "IS_AUTH_GUARDED":
-            updated.status = Status.VIOLATED
-            updated.evidence.append(
-                Evidence(
-                    id=_id("ev"),
-                    source="simulation",
-                    summary=f"{cond.plan_params.get('guard', 'guard')} missing",
-                    witness=f"no {cond.plan_params.get('guard', 'guard')}",
+        for ch in out["children"]:
+            updated.children.append(
+                SustainingCondition(
+                    id=_id("cond"),
+                    text=ch["text"],
+                    plan_kind=ch.get("plan_kind"),
+                    plan_params=ch.get("plan_params", {}),
                 )
             )
-        elif cond.text == "input is sanitized":
-            updated.status = Status.SATISFIED
-            updated.evidence.append(
-                Evidence(id=_id("ev"), source="simulation", summary="inputs are sanitized")
-            )
-        elif cond.text == "path reaches sink":
-            updated.children = [
-                SustainingCondition(id=_id("cond"), text="source reachable"),
-                SustainingCondition(id=_id("cond"), text="no filter"),
-            ]
-        elif cond.text == "source reachable":
-            updated.status = Status.SATISFIED
-            updated.evidence.append(
-                Evidence(id=_id("ev"), source="simulation", summary="path found")
-            )
-        elif cond.text == "no filter":
-            updated.status = Status.VIOLATED
-            updated.evidence.append(
-                Evidence(id=_id("ev"), source="simulation", summary="filter present")
-            )
-        else:
-            updated.status = Status.SATISFIED
         return updated
 
 
@@ -335,6 +484,7 @@ class AuditOrchestrator:
         return await agent.run(start_file=start_file, user_goal=user_goal)
 
     async def run(self, start_files: List[str], user_goal: Optional[str] = None) -> AuditReport:
+        self.run_id = _id("run")
         t0 = time.time()
         scout_reports = await asyncio.gather(*(self._scout(sf, user_goal) for sf in start_files))
         findings: List[Finding] = []
@@ -414,6 +564,8 @@ class AuditOrchestrator:
         if finding.invalidated and self.cfg.early_invalidate_on_first_violation:
             return
         context = {
+            "run_id": self.run_id,
+            "finding_id": finding.id,
             "finding_claim": finding.claim,
             "finding_evidence": [asdict(e) for e in finding.evidence],
             "siblings_status": [c.status.name for c in finding.root_conditions if c.id != cond.id],
