@@ -7,6 +7,13 @@ import asyncio
 from asyncio import CancelledError
 import time
 import uuid
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the import path when running this module as a script.
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+if __package__ in (None, ""):
+    __package__ = "architecture"
 
 from persistence import RunStore, BlobStore, RunEvent, EventType, DerivedState
 
