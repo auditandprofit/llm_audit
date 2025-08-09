@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 import asyncio
+from asyncio import CancelledError
 import time
 import uuid
 
@@ -186,26 +187,44 @@ class AuditOrchestrator:
                         },
                     )
                 )
-                async with sem:
-                    in_flight.add(task.id)
-                    try:
+                try:
+                    async with sem:
+                        in_flight.add(task.id)
                         usage = await self._handle_task(task, findings, task_queue)
-                    finally:
-                        in_flight.discard(task.id)
-                self.run_store.append(
-                    RunEvent(
-                        ts=time.time(),
-                        run_id=self.run_id,
-                        type=EventType.TASK_FINISHED,
-                        data={
-                            "task_id": task.id,
-                            "finding_id": task.payload.get("finding_id"),
-                            "condition_id": task.payload.get("condition_id"),
-                            **(usage or {}),
-                        },
+                except CancelledError:
+                    raise
+                except Exception as e:
+                    usage = None
+                    self.run_store.append(
+                        RunEvent(
+                            ts=time.time(),
+                            run_id=self.run_id,
+                            type=EventType.NODE_STATUS,
+                            data={
+                                "task_id": task.id,
+                                "finding_id": task.payload.get("finding_id"),
+                                "condition_id": task.payload.get("condition_id"),
+                                "status": "ERROR",
+                                "error": repr(e),
+                            },
+                        )
                     )
-                )
-                task_queue.task_done()
+                finally:
+                    in_flight.discard(task.id)
+                    self.run_store.append(
+                        RunEvent(
+                            ts=time.time(),
+                            run_id=self.run_id,
+                            type=EventType.TASK_FINISHED,
+                            data={
+                                "task_id": task.id,
+                                "finding_id": task.payload.get("finding_id"),
+                                "condition_id": task.payload.get("condition_id"),
+                                **(usage or {}),
+                            },
+                        )
+                    )
+                    task_queue.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(self.cfg.concurrent_validations)]
         await task_queue.join()
