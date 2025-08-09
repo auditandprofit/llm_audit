@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 import asyncio
@@ -22,6 +22,7 @@ from .models import (
     render_report,
 )
 from .llm import LLM_FAILURES
+from workflow import compute_digest
 
 
 @dataclass
@@ -31,7 +32,6 @@ class OrchestratorConfig:
     per_finding_max_tasks: int = 100
     concurrent_validations: int = 16
     early_invalidate_on_first_violation: bool = True
-    dedup_normalize_text: bool = True
     max_children_allowed: int = 3
 
 
@@ -63,22 +63,18 @@ class AuditOrchestrator:
         registry.register(PathExistsStrategy(llm=llm))
         registry.register(IsUserControlledStrategy(llm=llm))
         self.validation_agent = ValidationAgent(registry)
-        self._condition_index: Dict[str, str] = {}
+        self._condition_index: Dict[str, str] = {}  # digest -> cond.id
         self._condition_store: Dict[str, SustainingCondition] = {}
         self._per_finding_tasks = defaultdict(int)
         self.run_store = run_store or RunStore()
         self.blob_store = blob_store or BlobStore()
 
-    @staticmethod
-    def _norm(text: str) -> str:
-        return " ".join(text.lower().split())
-
     def _index_condition(self, cond: SustainingCondition) -> SustainingCondition:
-        key = self._norm(cond.text) if self.cfg.dedup_normalize_text else cond.text
-        if key in self._condition_index:
-            existing_id = self._condition_index[key]
+        digest = compute_digest(cond.text, cond.plan_kind, cond.plan_params)
+        if digest in self._condition_index:
+            existing_id = self._condition_index[digest]
             return self._condition_store[existing_id]
-        self._condition_index[key] = cond.id
+        self._condition_index[digest] = cond.id
         self._condition_store[cond.id] = cond
         return cond
 
@@ -249,6 +245,7 @@ class AuditOrchestrator:
             "max_children_allowed": self.cfg.max_children_allowed,
         }
         result = await self.validation_agent.validate(cond, context)
+        assert isinstance(result.status, Status)
         cond.evidence.extend(result.evidence)
         cond.status = result.status
         cond.notes.extend(result.notes)

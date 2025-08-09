@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from enum import Enum, auto
+from enum import Enum
 from typing import Any, Dict, List, Optional
 import uuid
 
-
-class Status(Enum):
-    UNKNOWN = auto()
-    SATISFIED = auto()
-    VIOLATED = auto()
+from workflow import Status  # re-export as the canonical Status
 
 
 class PlanKind(Enum):
