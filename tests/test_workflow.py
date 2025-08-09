@@ -13,6 +13,7 @@ from workflow import (
     Scheduler,
     Status,
     ValidationResult,
+    compute_digest,
 )
 
 
@@ -68,4 +69,11 @@ def test_scheduler_respects_task_budget():
     asyncio.run(sched.run(handler))
     assert g.node(n1.key).status is Status.SATISFIED
     assert g.node(n2.key).status is Status.UNKNOWN
+
+
+def test_condition_digest_includes_plan_and_params():
+    d1 = compute_digest("A", "X", {"p": 1})
+    d2 = compute_digest("A", "X", {"p": 2})
+    d3 = compute_digest("A", "Y", {"p": 1})
+    assert len({d1, d2, d3}) == 3
 
