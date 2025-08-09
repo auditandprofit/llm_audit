@@ -1,10 +1,12 @@
 from __future__ import annotations
-import sqlite3
-import json
 import hashlib
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List
 
 
 class EventType(Enum):
@@ -34,11 +36,18 @@ class DerivedState:
 
 
 class RunStore:
-    """SQLite-backed event store."""
+    """SQLite-backed event store (safe for concurrent async tasks)."""
 
     def __init__(self, path: str = "runs.db") -> None:
         self.path = path
-        self.conn = sqlite3.connect(self.path)
+        self._lock = threading.RLock()  # serialize writers
+        self.conn = sqlite3.connect(
+            self.path, check_same_thread=False, isolation_level=None
+        )
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
+        self.conn.execute("PRAGMA busy_timeout=3000;")
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS events(
@@ -51,25 +60,49 @@ class RunStore:
             """
         )
         self.conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_events_run_ts ON events(run_id, ts)"""
+            "CREATE INDEX IF NOT EXISTS idx_events_run_ts ON events(run_id, ts)"
         )
-        self.conn.commit()
+
+    @contextmanager
+    def _txn(self):
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                yield
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     def append(self, ev: RunEvent) -> None:
-        self.conn.execute(
-            "INSERT INTO events(run_id, ts, type, data_json) VALUES(?,?,?,?)",
-            (ev.run_id, ev.ts, ev.type.name, json.dumps(ev.data)),
-        )
-        self.conn.commit()
+        with self._txn():
+            self.conn.execute(
+                "INSERT INTO events(run_id, ts, type, data_json) VALUES(?,?,?,?)",
+                (ev.run_id, ev.ts, ev.type.name, json.dumps(ev.data)),
+            )
+
+    def append_many(self, events: List[RunEvent]) -> None:
+        if not events:
+            return
+        with self._txn():
+            self.conn.executemany(
+                "INSERT INTO events(run_id, ts, type, data_json) VALUES(?,?,?,?)",
+                [
+                    (e.run_id, e.ts, e.type.name, json.dumps(e.data))
+                    for e in events
+                ],
+            )
 
     def load(self, run_id: str) -> List[RunEvent]:
-        cur = self.conn.execute(
-            "SELECT ts, type, data_json FROM events WHERE run_id=? ORDER BY ts",
-            (run_id,),
-        )
-        events: List[RunEvent] = []
-        for ts, type_str, data_json in cur.fetchall():
-            events.append(
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT ts, type, data_json FROM events WHERE run_id=? ORDER BY ts",
+                (run_id,),
+            )
+            rows = cur.fetchall()
+        out: List[RunEvent] = []
+        for ts, type_str, data_json in rows:
+            out.append(
                 RunEvent(
                     ts=ts,
                     run_id=run_id,
@@ -77,7 +110,7 @@ class RunStore:
                     data=json.loads(data_json),
                 )
             )
-        return events
+        return out
 
     def latest_state(self, run_id: str) -> DerivedState:
         state = DerivedState()
@@ -98,12 +131,32 @@ class RunStore:
         state.queue = list(tasks.values())
         return state
 
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
 
 class BlobStore:
     """Content-addressed blob store backed by SQLite."""
 
     def __init__(self, path: str = "runs.db") -> None:
-        self.conn = sqlite3.connect(path)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None
+        )
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
+        self.conn.execute("PRAGMA busy_timeout=3000;")
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blobs(
@@ -112,19 +165,32 @@ class BlobStore:
             )
             """
         )
-        self.conn.commit()
 
     def put(self, b: bytes) -> str:
         sha = hashlib.sha256(b).hexdigest()
-        self.conn.execute(
-            "INSERT OR IGNORE INTO blobs(sha, bytes) VALUES(?, ?)", (sha, b)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO blobs(sha, bytes) VALUES(?, ?)", (sha, b)
+            )
         return sha
 
     def get(self, sha: str) -> bytes:
-        cur = self.conn.execute("SELECT bytes FROM blobs WHERE sha=?", (sha,))
-        row = cur.fetchone()
+        with self._lock:
+            cur = self.conn.execute("SELECT bytes FROM blobs WHERE sha=?", (sha,))
+            row = cur.fetchone()
         if row is None:
             raise KeyError(sha)
         return row[0]
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
