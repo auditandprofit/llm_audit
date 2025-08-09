@@ -9,6 +9,7 @@ import uuid
 import json
 import jsonschema
 import re
+from persistence import RunStore, BlobStore, RunEvent, EventType, DerivedState
 
 
 # =============== Prompt Packet & Schemas ===============
@@ -129,22 +130,84 @@ SCOUT_OUTPUT_SCHEMA = {
 
 LLM_FAILURES: List[str] = []
 
-async def call_llm_with_schema(llm, *, system, messages, schema, max_retries=2,
-                               temperature=0, top_p=1, max_tokens=1024):
+async def call_llm_with_schema(
+    llm,
+    *,
+    system,
+    messages,
+    schema,
+    max_retries=2,
+    temperature=0,
+    top_p=1,
+    max_tokens=1024,
+    run_store: Optional[RunStore] = None,
+    blob_store: Optional[BlobStore] = None,
+    run_id: str = "",
+    task_id: str = "",
+    finding_id: str = "",
+    condition_id: str = "",
+):
+    t0 = time.time()
     for attempt in range(max_retries + 1):
-        resp = await llm.complete(system=system, messages=messages, json_schema=schema,
-                                  temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        resp = await llm.complete(
+            system=system,
+            messages=messages,
+            json_schema=schema,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
         text = resp.get("text") if isinstance(resp, dict) else resp
         m = re.search(r"\{.*\}\s*$", text or "", re.S)
         if not m:
-            messages.append({"role": "system", "content": "Your previous reply did not contain a JSON object. Return ONLY JSON."})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Your previous reply did not contain a JSON object. Return ONLY JSON.",
+                }
+            )
+            if run_store:
+                run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=run_id,
+                        type=EventType.LLM_RETRY,
+                        data={"task_id": task_id, "finding_id": finding_id, "condition_id": condition_id, "attempt": attempt + 1},
+                    )
+                )
             continue
         try:
             obj = json.loads(m.group(0))
             jsonschema.validate(obj, schema)
-            return obj
+            latency = time.time() - t0
+            prompt_bytes = json.dumps({"system": system, "messages": messages}).encode()
+            response_bytes = text.encode()
+            prompt_sha = blob_store.put(prompt_bytes) if blob_store else None
+            response_sha = blob_store.put(response_bytes) if blob_store else None
+            usage = {
+                "latency_s": latency,
+                "prompt_sha": prompt_sha,
+                "response_sha": response_sha,
+                "prompt_tokens": len(prompt_bytes.split()),
+                "response_tokens": len(response_bytes.split()),
+            }
+            return obj, usage
         except Exception as e:
-            messages.append({"role": "system", "content": f"Your JSON was invalid ({e}). Fix it to match the schema exactly."})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Your JSON was invalid ({e}). Fix it to match the schema exactly.",
+                }
+            )
+            if run_store and attempt + 1 <= max_retries:
+                run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=run_id,
+                        type=EventType.LLM_RETRY,
+                        data={"task_id": task_id, "finding_id": finding_id, "condition_id": condition_id, "attempt": attempt + 1},
+                    )
+                )
     LLM_FAILURES.append("exhausted retries")
     messages.append({"role": "system", "content": "LLM call failed after retries"})
     raise ValueError("LLM failed to produce valid JSON after retries")
@@ -352,9 +415,14 @@ class TinyShellAgent:
             few_shot_example=few_shot,
         )
         messages = [{"role": "system", "content": packet}]
-        out = await call_llm_with_schema(
-            self.llm, system="Follow the packet.", messages=messages, schema=SCOUT_OUTPUT_SCHEMA,
-            temperature=0, top_p=1, max_tokens=1024
+        out, _usage = await call_llm_with_schema(
+            self.llm,
+            system="Follow the packet.",
+            messages=messages,
+            schema=SCOUT_OUTPUT_SCHEMA,
+            temperature=0,
+            top_p=1,
+            max_tokens=1024,
         )
         findings: List[Finding] = []
         for f in out["findings"]:
@@ -381,14 +449,28 @@ class TinyShellAgent:
 class ValidationAgent:
     """Simple validator that expands one condition into two sub-conditions."""
 
-    def __init__(self, agent_id: str, llm: LLMClient, code: CodebaseAdapter,
-                 web: Optional[WebSearchAdapter] = None):
+    def __init__(
+        self,
+        agent_id: str,
+        llm: LLMClient,
+        code: CodebaseAdapter,
+        web: Optional[WebSearchAdapter] = None,
+    ):
         self.agent_id = agent_id
         self.llm = llm
         self.code = code
         self.web = web
 
-    async def validate(self, cond: SustainingCondition, context: Dict[str, Any]) -> SustainingCondition:
+    async def validate(
+        self,
+        cond: SustainingCondition,
+        context: Dict[str, Any],
+        *,
+        task_id: str,
+        run_store: Optional[RunStore] = None,
+        blob_store: Optional[BlobStore] = None,
+        run_id: str = "",
+    ) -> Tuple[SustainingCondition, Dict[str, Any]]:
         ctx = {
             "condition_text": cond.text,
             "plan_kind": cond.plan_kind,
@@ -422,9 +504,20 @@ class ValidationAgent:
             few_shot_example=few_shot,
         )
         messages = [{"role": "system", "content": packet}]
-        out = await call_llm_with_schema(
-            self.llm, system="Follow the packet.", messages=messages, schema=VALIDATION_OUTPUT_SCHEMA,
-            temperature=0, top_p=1, max_tokens=1024
+        out, usage = await call_llm_with_schema(
+            self.llm,
+            system="Follow the packet.",
+            messages=messages,
+            schema=VALIDATION_OUTPUT_SCHEMA,
+            temperature=0,
+            top_p=1,
+            max_tokens=1024,
+            run_store=run_store,
+            blob_store=blob_store,
+            run_id=run_id,
+            task_id=task_id,
+            finding_id=context.get("finding_id", ""),
+            condition_id=cond.id,
         )
         updated = SustainingCondition(
             id=cond.id,
@@ -455,7 +548,7 @@ class ValidationAgent:
                 )
             )
         updated.notes = out.get("notes", [])
-        return updated
+        return updated, usage
 
 
 # =============== Orchestrator ===============
@@ -482,8 +575,15 @@ class Task:
 
 
 class AuditOrchestrator:
-    def __init__(self, code: CodebaseAdapter, llm: LLMClient,
-                 web: Optional[WebSearchAdapter] = None, config: Optional[OrchestratorConfig] = None):
+    def __init__(
+        self,
+        code: CodebaseAdapter,
+        llm: LLMClient,
+        web: Optional[WebSearchAdapter] = None,
+        config: Optional[OrchestratorConfig] = None,
+        run_store: Optional[RunStore] = None,
+        blob_store: Optional[BlobStore] = None,
+    ):
         self.code = code
         self.llm = llm
         self.web = web
@@ -492,6 +592,8 @@ class AuditOrchestrator:
         self._condition_index: Dict[str, str] = {}
         self._condition_store: Dict[str, SustainingCondition] = {}
         self._per_finding_tasks = defaultdict(int)
+        self.run_store = run_store or RunStore()
+        self.blob_store = blob_store or BlobStore()
 
     @staticmethod
     def _norm(text: str) -> str:
@@ -524,14 +626,53 @@ class AuditOrchestrator:
         def enqueue(f: Finding, task: Task) -> None:
             nonlocal tasks_created
             if tasks_created >= self.cfg.max_tasks:
+                self.run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=self.run_id,
+                        type=EventType.BUDGET_HIT,
+                        data={"task_id": task.id, "finding_id": f.id, "kind": "total"},
+                    )
+                )
                 return
             if self._per_finding_tasks[f.id] >= self.cfg.per_finding_max_tasks:
+                self.run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=self.run_id,
+                        type=EventType.BUDGET_HIT,
+                        data={"task_id": task.id, "finding_id": f.id, "kind": "per_finding"},
+                    )
+                )
                 f.invalidated = True
                 f.invalidation_reason = "Budget exceeded"
                 return
             self._per_finding_tasks[f.id] += 1
             task_queue.put_nowait((task.priority, task.id, task))
             tasks_created += 1
+            cond_id = task.payload.get("condition_id")
+            cond = self._condition_store.get(cond_id)
+            cond_data = (
+                {
+                    "id": cond.id,
+                    "text": cond.text,
+                    "status": cond.status.name,
+                    "parent_id": cond.parent_id,
+                    "depth": cond.depth,
+                    "plan_kind": cond.plan_kind,
+                    "plan_params": cond.plan_params,
+                }
+                if cond
+                else {}
+            )
+            self.run_store.append(
+                RunEvent(
+                    ts=time.time(),
+                    run_id=self.run_id,
+                    type=EventType.TASK_ENQUEUED,
+                    data={"task": asdict(task), "finding_id": f.id, "condition": cond_data},
+                )
+            )
 
         for f in findings:
             for rc in f.root_conditions:
@@ -559,13 +700,38 @@ class AuditOrchestrator:
                 if task.depth > self.cfg.max_depth or tasks_created > self.cfg.max_tasks:
                     task_queue.task_done()
                     continue
+                self.run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=self.run_id,
+                        type=EventType.TASK_STARTED,
+                        data={
+                            "task_id": task.id,
+                            "finding_id": task.payload.get("finding_id"),
+                            "condition_id": task.payload.get("condition_id"),
+                        },
+                    )
+                )
                 async with sem:
                     in_flight.add(task.id)
                     try:
-                        await self._handle_task(task, findings, task_queue)
+                        usage = await self._handle_task(task, findings, task_queue)
                     finally:
                         in_flight.discard(task.id)
-                        task_queue.task_done()
+                self.run_store.append(
+                    RunEvent(
+                        ts=time.time(),
+                        run_id=self.run_id,
+                        type=EventType.TASK_FINISHED,
+                        data={
+                            "task_id": task.id,
+                            "finding_id": task.payload.get("finding_id"),
+                            "condition_id": task.payload.get("condition_id"),
+                            **(usage or {}),
+                        },
+                    )
+                )
+                task_queue.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(self.cfg.concurrent_validations)]
         await task_queue.join()
@@ -575,10 +741,20 @@ class AuditOrchestrator:
         return AuditReport(findings=findings, started_at=t0, finished_at=t1,
                            meta={"tasks_created": tasks_created, "llm_failures": LLM_FAILURES})
 
-    async def _handle_task(self, task: Task, findings: List[Finding],
-                           task_queue: asyncio.PriorityQueue):
+    def resume(self, run_id: str) -> DerivedState:
+        """Load events for ``run_id`` and return derived state.
+
+        This provides insight into pending tasks and counts to support
+        resuming or auditing a prior run.
+        """
+        return self.run_store.latest_state(run_id)
+
+    async def _handle_task(
+        self, task: Task, findings: List[Finding], task_queue: asyncio.PriorityQueue
+    ):
         if task.kind == "validate_condition":
-            await self._handle_validate(task, findings, task_queue)
+            return await self._handle_validate(task, findings, task_queue)
+        return None
 
     async def _handle_validate(self, task: Task, findings: List[Finding],
                                task_queue: asyncio.PriorityQueue):
@@ -598,14 +774,34 @@ class AuditOrchestrator:
             "siblings_status": [c.status.name for c in finding.root_conditions if c.id != cond.id],
             "max_children_allowed": self.cfg.max_children_allowed,
         }
-        updated = await self.validation_agent.validate(cond, context)
+        updated, usage = await self.validation_agent.validate(
+            cond,
+            context,
+            task_id=task.id,
+            run_store=self.run_store,
+            blob_store=self.blob_store,
+            run_id=self.run_id,
+        )
         cond.evidence.extend(updated.evidence)
         cond.status = updated.status
         cond.notes.extend(updated.notes)
+        self.run_store.append(
+            RunEvent(
+                ts=time.time(),
+                run_id=self.run_id,
+                type=EventType.NODE_STATUS,
+                data={
+                    "task_id": task.id,
+                    "finding_id": finding.id,
+                    "condition_id": cond.id,
+                    "status": cond.status.name,
+                },
+            )
+        )
         if cond.status == Status.VIOLATED and self.cfg.early_invalidate_on_first_violation:
             finding.invalidated = True
             finding.invalidation_reason = f"Condition failed: {cond.text}"
-            return
+            return usage
         for child in updated.children[: self.cfg.max_children_allowed]:
             child.parent_id = cond.id
             child.depth = cond.depth + 1
@@ -622,7 +818,7 @@ class AuditOrchestrator:
                     priority=task.priority + 1,
                 )
                 self._enqueue_task(finding, new_task)
-
+        return usage
 
 # =============== Demo ===============
 
