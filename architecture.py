@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from typing import List, Dict, Optional, Any, Tuple, Set
+from collections import defaultdict
 import asyncio
 import time
 import uuid
@@ -35,6 +36,7 @@ class Evidence:
     locations: List[CodeSpan] = field(default_factory=list)
     strength: float = 0.5
     raw_refs: Dict[str, Any] = field(default_factory=dict)
+    witness: Optional[str] = None
 
 
 @dataclass
@@ -47,6 +49,8 @@ class SustainingCondition:
     discovered_by_agent: Optional[str] = None
     parent_id: Optional[str] = None
     depth: int = 0
+    plan_kind: Optional[str] = None
+    plan_params: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -85,6 +89,29 @@ class AuditReport:
             "finished_at": self.finished_at,
             "meta": self.meta,
         }
+
+
+def render_report(rep: AuditReport) -> str:
+    def badge(s: Status) -> str:
+        return {Status.SATISFIED: "✅", Status.VIOLATED: "❌", Status.UNKNOWN: "❔"}[s]
+
+    lines: List[str] = []
+    for f in rep.findings:
+        head = "INVALID" if f.invalidated else "VALID?"
+        reason = f.invalidation_reason or ""
+        lines.append(f"[{head}] {f.claim}  ({f.origin_file}) {reason}")
+
+        for rc in f.root_conditions:
+            def walk(c: SustainingCondition, indent: int = 2) -> None:
+                lines.append(" " * indent + f"{badge(c.status)} {c.text}")
+                for ev in c.evidence:
+                    lines.append(" " * (indent + 2) + f"- {ev.summary}")
+                for ch in c.children:
+                    walk(ch, indent + 2)
+
+            walk(rc)
+
+    return "\n".join(lines)
 
 
 # =============== Adapters (IO / Tools) ===============
@@ -144,8 +171,18 @@ class TinyShellAgent:
             severity="Low",
             evidence=[],
             root_conditions=[
-                SustainingCondition(id=_id("cond"), text="input is sanitized"),
-                SustainingCondition(id=_id("cond"), text="path reaches sink"),
+                SustainingCondition(
+                    id=_id("cond"),
+                    text="input is sanitized",
+                    plan_kind="IS_USER_CONTROLLED",
+                    plan_params={"symbol": "request.args"},
+                ),
+                SustainingCondition(
+                    id=_id("cond"),
+                    text="path reaches sink",
+                    plan_kind="PATH_EXISTS",
+                    plan_params={"sink": "util.eval"},
+                ),
             ],
             agent_id=self.agent_id,
         )
@@ -169,8 +206,59 @@ class ValidationAgent:
         self.web = web
 
     async def validate(self, cond: SustainingCondition, context: Dict[str, Any]) -> SustainingCondition:
-        updated = SustainingCondition(id=cond.id, text=cond.text)
-        if cond.text == "input is sanitized":
+        updated = SustainingCondition(
+            id=cond.id,
+            text=cond.text,
+            plan_kind=cond.plan_kind,
+            plan_params=cond.plan_params,
+        )
+        if cond.plan_kind == "IS_USER_CONTROLLED":
+            updated.status = Status.SATISFIED
+            updated.evidence.append(
+                Evidence(
+                    id=_id("ev"),
+                    source="simulation",
+                    summary=f"{cond.plan_params.get('symbol', 'input')} appears user-controlled",
+                    witness="example: request.args['q']",
+                )
+            )
+        elif cond.plan_kind == "PATH_EXISTS":
+            if cond.text == "path reaches sink":
+                updated.children = [
+                    SustainingCondition(
+                        id=_id("cond"),
+                        text="source reachable",
+                        plan_kind="PATH_EXISTS",
+                        plan_params={"sink": cond.plan_params.get("sink")},
+                    ),
+                    SustainingCondition(
+                        id=_id("cond"),
+                        text="no filter",
+                        plan_kind="IS_AUTH_GUARDED",
+                        plan_params={"guard": "sanitize"},
+                    ),
+                ]
+            else:
+                updated.status = Status.SATISFIED
+                updated.evidence.append(
+                    Evidence(
+                        id=_id("ev"),
+                        source="simulation",
+                        summary="path found",
+                        witness="example path",
+                    )
+                )
+        elif cond.plan_kind == "IS_AUTH_GUARDED":
+            updated.status = Status.VIOLATED
+            updated.evidence.append(
+                Evidence(
+                    id=_id("ev"),
+                    source="simulation",
+                    summary=f"{cond.plan_params.get('guard', 'guard')} missing",
+                    witness=f"no {cond.plan_params.get('guard', 'guard')}",
+                )
+            )
+        elif cond.text == "input is sanitized":
             updated.status = Status.SATISFIED
             updated.evidence.append(
                 Evidence(id=_id("ev"), source="simulation", summary="inputs are sanitized")
@@ -201,6 +289,7 @@ class ValidationAgent:
 class OrchestratorConfig:
     max_depth: int = 4
     max_tasks: int = 500
+    per_finding_max_tasks: int = 100
     concurrent_validations: int = 16
     early_invalidate_on_first_violation: bool = True
     dedup_normalize_text: bool = True
@@ -226,6 +315,7 @@ class AuditOrchestrator:
         self.validation_agent = ValidationAgent(agent_id="validator", llm=llm, code=code, web=web)
         self._condition_index: Dict[str, str] = {}
         self._condition_store: Dict[str, SustainingCondition] = {}
+        self._per_finding_tasks = defaultdict(int)
 
     @staticmethod
     def _norm(text: str) -> str:
@@ -250,8 +340,22 @@ class AuditOrchestrator:
         findings: List[Finding] = []
         for r in scout_reports:
             findings.extend(r.findings)
+        self._per_finding_tasks.clear()
         task_queue: asyncio.PriorityQueue[Tuple[int, str, Task]] = asyncio.PriorityQueue()
         tasks_created = 0
+
+        def enqueue(f: Finding, task: Task) -> None:
+            nonlocal tasks_created
+            if tasks_created >= self.cfg.max_tasks:
+                return
+            if self._per_finding_tasks[f.id] >= self.cfg.per_finding_max_tasks:
+                f.invalidated = True
+                f.invalidation_reason = "Budget exceeded"
+                return
+            self._per_finding_tasks[f.id] += 1
+            task_queue.put_nowait((task.priority, task.id, task))
+            tasks_created += 1
+
         for f in findings:
             for rc in f.root_conditions:
                 rc.parent_id = None
@@ -266,8 +370,8 @@ class AuditOrchestrator:
                     depth=0,
                     priority=0,
                 )
-                task_queue.put_nowait((task.priority, task.id, task))
-                tasks_created += 1
+                enqueue(f, task)
+        self._enqueue_task = enqueue
         in_flight: Set[str] = set()
         sem = asyncio.Semaphore(self.cfg.concurrent_validations)
 
@@ -336,7 +440,7 @@ class AuditOrchestrator:
                     depth=task.depth + 1,
                     priority=task.priority + 1,
                 )
-                task_queue.put_nowait((new_task.priority, new_task.id, new_task))
+                self._enqueue_task(finding, new_task)
 
 
 # =============== Demo ===============
@@ -346,7 +450,7 @@ async def main() -> None:
     llm = LLMClient()
     orch = AuditOrchestrator(code=code, llm=llm)
     report = await orch.run(start_files=["start.py"])
-    print(report.to_dict())
+    print(render_report(report))
 
 
 if __name__ == "__main__":
