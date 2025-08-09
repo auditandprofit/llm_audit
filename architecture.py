@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
-from typing import List, Dict, Optional, Any, Tuple, Set
+from typing import List, Dict, Optional, Any, Tuple, Set, Protocol
 from collections import defaultdict
 import asyncio
 import time
@@ -158,6 +158,11 @@ class Status(Enum):
     VIOLATED = auto()
 
 
+class PlanKind(Enum):
+    PATH_EXISTS = "PATH_EXISTS"
+    IS_USER_CONTROLLED = "IS_USER_CONTROLLED"
+
+
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
@@ -194,6 +199,20 @@ class SustainingCondition:
     plan_kind: Optional[str] = None
     plan_params: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationInput:
+    condition: SustainingCondition
+    context: Dict[str, Any]
+
+
+@dataclass
+class ValidationResult:
+    status: Status
+    children: List[SustainingCondition]
+    evidence: List[Evidence]
+    notes: List[str]
 
 
 @dataclass
@@ -314,6 +333,111 @@ class LLMClient:
 
 # =============== Agents ===============
 
+class ValidationStrategy(Protocol):
+    kind: PlanKind
+    async def validate(self, inp: ValidationInput) -> ValidationResult:
+        ...
+
+
+class StrategyRegistry:
+    def __init__(self) -> None:
+        self._by: Dict[PlanKind, ValidationStrategy] = {}
+
+    def register(self, strat: ValidationStrategy) -> None:
+        self._by[strat.kind] = strat
+
+    def get(self, kind: PlanKind) -> ValidationStrategy:
+        return self._by[kind]
+
+
+class PathExistsStrategy:
+    kind = PlanKind.PATH_EXISTS
+
+    def __init__(self, llm: Optional[LLMClient] = None):
+        self.llm = llm
+
+    async def validate(self, inp: ValidationInput) -> ValidationResult:
+        if self.llm:
+            try:
+                resp = await self.llm.complete(
+                    system="path_exists",
+                    messages=[],
+                    json_schema=VALIDATION_OUTPUT_SCHEMA,
+                )
+                data = json.loads(resp.get("text", "{}"))
+                jsonschema.validate(data, VALIDATION_OUTPUT_SCHEMA)
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                raise ValueError("LLM returned invalid output") from e
+            status = Status[data.get("status", "UNKNOWN")]
+            notes = data.get("notes", [])
+            children = [
+                SustainingCondition(
+                    id=_id("cond"),
+                    text=ch["text"],
+                    plan_kind=ch.get("plan_kind"),
+                    plan_params=ch.get("plan_params", {}),
+                )
+                for ch in data.get("children", [])
+            ]
+            return ValidationResult(status=status, children=children, evidence=[], notes=notes)
+        child = SustainingCondition(id=_id("cond"), text="trace from A to sink X", plan_kind=None, plan_params={})
+        return ValidationResult(status=Status.UNKNOWN, children=[child], evidence=[], notes=["needs call graph"])
+
+
+class IsUserControlledStrategy:
+    kind = PlanKind.IS_USER_CONTROLLED
+
+    def __init__(self, llm: Optional[LLMClient] = None):
+        self.llm = llm
+
+    async def validate(self, inp: ValidationInput) -> ValidationResult:
+        if self.llm:
+            try:
+                resp = await self.llm.complete(
+                    system="is_user_controlled",
+                    messages=[],
+                    json_schema=VALIDATION_OUTPUT_SCHEMA,
+                )
+                data = json.loads(resp.get("text", "{}"))
+                jsonschema.validate(data, VALIDATION_OUTPUT_SCHEMA)
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                raise ValueError("LLM returned invalid output") from e
+            status = Status[data.get("status", "UNKNOWN")]
+            notes = data.get("notes", [])
+            evidence = [
+                Evidence(
+                    id=_id("ev"),
+                    source=ev.get("source", ""),
+                    summary=ev.get("summary", ""),
+                    locations=[CodeSpan(**loc) for loc in ev.get("locations", [])],
+                    strength=ev.get("strength", 0.5),
+                    raw_refs=ev.get("raw_refs", {}),
+                    witness=ev.get("witness"),
+                )
+                for ev in data.get("evidence", [])
+            ]
+            return ValidationResult(status=status, children=[], evidence=evidence, notes=notes)
+        ev = Evidence(id=_id("ev"), source="analysis", summary="user input sanitized", locations=[], strength=0.5)
+        return ValidationResult(status=Status.SATISFIED, children=[], evidence=[ev], notes=[])
+
+
+class ValidationAgent:
+    def __init__(self, registry: StrategyRegistry):
+        self.r = registry
+
+    async def validate(self, cond: SustainingCondition, ctx: Dict[str, Any]) -> ValidationResult:
+        try:
+            kind = PlanKind(cond.plan_kind) if cond.plan_kind else PlanKind.PATH_EXISTS
+        except ValueError as e:
+            raise KeyError(f"Unknown plan kind: {cond.plan_kind}") from e
+        strat = self.r.get(kind)
+        return await strat.validate(ValidationInput(cond, ctx))
+
+
 class TinyShellAgent:
     """Simulated agent producing a hard-coded finding."""
 
@@ -378,86 +502,6 @@ class TinyShellAgent:
         )
 
 
-class ValidationAgent:
-    """Simple validator that expands one condition into two sub-conditions."""
-
-    def __init__(self, agent_id: str, llm: LLMClient, code: CodebaseAdapter,
-                 web: Optional[WebSearchAdapter] = None):
-        self.agent_id = agent_id
-        self.llm = llm
-        self.code = code
-        self.web = web
-
-    async def validate(self, cond: SustainingCondition, context: Dict[str, Any]) -> SustainingCondition:
-        ctx = {
-            "condition_text": cond.text,
-            "plan_kind": cond.plan_kind,
-            "plan_params": cond.plan_params,
-            "finding_claim": context.get("finding_claim"),
-            "siblings_status": context.get("siblings_status"),
-            "known_evidence": context.get("finding_evidence"),
-            "max_children_allowed": context.get("max_children_allowed"),
-        }
-        few_shot = json.dumps({
-            "status": "UNKNOWN",
-            "evidence": [],
-            "children": [
-                {
-                    "text": "trace from A to sink X",
-                    "plan_kind": "PATH_EXISTS",
-                    "plan_params": {"sink": "X"},
-                }
-            ],
-            "notes": ["Need call graph for X"],
-        }, indent=2)
-        packet = PROMPT_PACKET.format(
-            role="a static-analysis validator",
-            intent="VALIDATE_CONDITION",
-            run_id=context.get("run_id", ""),
-            finding_id=context.get("finding_id", ""),
-            condition_id=cond.id,
-            parent_condition_id=cond.parent_id,
-            context_block=json.dumps(ctx, indent=2),
-            json_schema=json.dumps(VALIDATION_OUTPUT_SCHEMA, indent=2),
-            few_shot_example=few_shot,
-        )
-        messages = [{"role": "system", "content": packet}]
-        out = await call_llm_with_schema(
-            self.llm, system="Follow the packet.", messages=messages, schema=VALIDATION_OUTPUT_SCHEMA,
-            temperature=0, top_p=1, max_tokens=1024
-        )
-        updated = SustainingCondition(
-            id=cond.id,
-            text=cond.text,
-            plan_kind=cond.plan_kind,
-            plan_params=cond.plan_params,
-        )
-        updated.status = Status[out["status"]]
-        for ev in out["evidence"]:
-            updated.evidence.append(
-                Evidence(
-                    id=_id("ev"),
-                    source=ev["source"],
-                    summary=ev["summary"],
-                    locations=[CodeSpan(**loc) for loc in ev.get("locations", [])],
-                    strength=ev["strength"],
-                    raw_refs=ev.get("raw_refs", {}),
-                    witness=ev.get("witness"),
-                )
-            )
-        for ch in out["children"]:
-            updated.children.append(
-                SustainingCondition(
-                    id=_id("cond"),
-                    text=ch["text"],
-                    plan_kind=ch.get("plan_kind"),
-                    plan_params=ch.get("plan_params", {}),
-                )
-            )
-        updated.notes = out.get("notes", [])
-        return updated
-
-
 # =============== Orchestrator ===============
 
 @dataclass
@@ -488,7 +532,10 @@ class AuditOrchestrator:
         self.llm = llm
         self.web = web
         self.cfg = config or OrchestratorConfig()
-        self.validation_agent = ValidationAgent(agent_id="validator", llm=llm, code=code, web=web)
+        registry = StrategyRegistry()
+        registry.register(PathExistsStrategy(llm=llm))
+        registry.register(IsUserControlledStrategy(llm=llm))
+        self.validation_agent = ValidationAgent(registry)
         self._condition_index: Dict[str, str] = {}
         self._condition_store: Dict[str, SustainingCondition] = {}
         self._per_finding_tasks = defaultdict(int)
@@ -598,15 +645,15 @@ class AuditOrchestrator:
             "siblings_status": [c.status.name for c in finding.root_conditions if c.id != cond.id],
             "max_children_allowed": self.cfg.max_children_allowed,
         }
-        updated = await self.validation_agent.validate(cond, context)
-        cond.evidence.extend(updated.evidence)
-        cond.status = updated.status
-        cond.notes.extend(updated.notes)
+        result = await self.validation_agent.validate(cond, context)
+        cond.evidence.extend(result.evidence)
+        cond.status = result.status
+        cond.notes.extend(result.notes)
         if cond.status == Status.VIOLATED and self.cfg.early_invalidate_on_first_violation:
             finding.invalidated = True
             finding.invalidation_reason = f"Condition failed: {cond.text}"
             return
-        for child in updated.children[: self.cfg.max_children_allowed]:
+        for child in result.children[: self.cfg.max_children_allowed]:
             child.parent_id = cond.id
             child.depth = cond.depth + 1
             node = self._index_condition(child)
