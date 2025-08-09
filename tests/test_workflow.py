@@ -71,9 +71,9 @@ def test_scheduler_respects_task_budget():
     assert g.node(n2.key).status is Status.UNKNOWN
 
 
-def test_condition_digest_includes_plan_and_params():
-    d1 = compute_digest("A", "X", {"p": 1})
-    d2 = compute_digest("A", "X", {"p": 2})
-    d3 = compute_digest("A", "Y", {"p": 1})
+def test_condition_digest_includes_params():
+    d1 = compute_digest("A", {"p": 1})
+    d2 = compute_digest("A", {"p": 2})
+    d3 = compute_digest("B", {"p": 1})
     assert len({d1, d2, d3}) == 3
 

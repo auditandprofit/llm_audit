@@ -7,7 +7,6 @@ from .llm import (
 )
 from .models import (
     Status,
-    PlanKind,
     CodeSpan,
     Evidence,
     SustainingCondition,
@@ -20,13 +19,7 @@ from .models import (
     _id,
 )
 from .adapters import CodebaseAdapter, WebSearchAdapter, LLMClient
-from .strategies import (
-    ValidationStrategy,
-    StrategyRegistry,
-    PathExistsStrategy,
-    IsUserControlledStrategy,
-)
-from .agents import ValidationAgent, TinyShellAgent
+from .agents import ShellLLMAgent, TinyShellAgent
 from .orchestrator import OrchestratorConfig, Task, AuditOrchestrator
 
 __all__ = [
@@ -36,7 +29,6 @@ __all__ = [
     "LLM_FAILURES",
     "call_llm_with_schema",
     "Status",
-    "PlanKind",
     "CodeSpan",
     "Evidence",
     "SustainingCondition",
@@ -50,11 +42,7 @@ __all__ = [
     "CodebaseAdapter",
     "WebSearchAdapter",
     "LLMClient",
-    "ValidationStrategy",
-    "StrategyRegistry",
-    "PathExistsStrategy",
-    "IsUserControlledStrategy",
-    "ValidationAgent",
+    "ShellLLMAgent",
     "TinyShellAgent",
     "OrchestratorConfig",
     "Task",

@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from enum import Enum
 from typing import Any, Dict, List, Optional
 import uuid
 
 from workflow import Status  # re-export as the canonical Status
-
-
-class PlanKind(Enum):
-    PATH_EXISTS = "PATH_EXISTS"
-    IS_USER_CONTROLLED = "IS_USER_CONTROLLED"
 
 
 def _id(prefix: str) -> str:
@@ -46,7 +40,6 @@ class SustainingCondition:
     discovered_by_agent: Optional[str] = None
     parent_id: Optional[str] = None
     depth: int = 0
-    plan_kind: Optional[str] = None
     plan_params: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 

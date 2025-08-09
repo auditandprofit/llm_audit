@@ -101,10 +101,9 @@ VALIDATION_OUTPUT_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["text", "plan_kind", "plan_params"],
+                "required": ["text", "plan_params"],
                 "properties": {
                     "text": {"type": "string"},
-                    "plan_kind": {"type": "string"},
                     "plan_params": {"type": "object"}
                 }
             }
@@ -130,10 +129,9 @@ SCOUT_OUTPUT_SCHEMA = {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "required": ["text", "plan_kind", "plan_params"],
+                            "required": ["text", "plan_params"],
                             "properties": {
                                 "text": {"type": "string"},
-                                "plan_kind": {"type": "string"},
                                 "plan_params": {"type": "object"}
                             }
                         }

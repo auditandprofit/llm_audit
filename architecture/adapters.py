@@ -55,12 +55,10 @@ class LLMClient:
                             "root_conditions": [
                                 {
                                     "text": "input is sanitized",
-                                    "plan_kind": "IS_USER_CONTROLLED",
                                     "plan_params": {},
                                 },
                                 {
                                     "text": "path reaches sink",
-                                    "plan_kind": "PATH_EXISTS",
                                     "plan_params": {"sink": "util.eval"},
                                 },
                             ],
